@@ -472,13 +472,35 @@ function addDays(d,n){ const r=new Date(d); r.setDate(r.getDate()+n); return r; 
 function diffDays(a,b){ return Math.round((b-a)/86400000); }
 function fmtDate(ms){ return new Date(ms).toLocaleDateString('en-GB',{day:'numeric',month:'short'}); }
 function toDateStr(d){ return d.toISOString().slice(0,10); }
+function isSat(d){ return d.getDay()===6; } // 0=Sun,6=Sat
+function isSun(d){ return d.getDay()===0; }
+
+// If a scheduled date falls on Saturday, push it to Sunday instead.
+// This keeps Saturdays free and concentrates more work on Sundays.
+function skipSat(d){
+  const r=new Date(d);
+  if(isSat(r)) r.setDate(r.getDate()+1); // Sat → Sun
+  return r;
+}
+
+// Calculate next review date, then apply Saturday skip
+function calcNextMs(learnedMs, stage, fallbackNow){
+  const base = dateOf(learnedMs || fallbackNow.getTime());
+  let d;
+  if(stage < SR.length){
+    d = addDays(base, SR[stage]);
+  } else {
+    d = addDays(fallbackNow, 60);
+  }
+  return skipSat(d).getTime();
+}
 
 // ═══════════════════════════════════════
 // TOPIC LOGIC
 // ═══════════════════════════════════════
 function nextReview(t){
   if(t.stage<0||!t.learnedMs) return null;
-  if(t.stage<SR.length) return addDays(dateOf(t.learnedMs), SR[t.stage]);
+  // Always recalculate through skipSat so stored nextMs is authoritative
   return new Date(t.nextMs);
 }
 function isMastered(t){ return t.stage>=SR.length; }
@@ -486,6 +508,8 @@ function isDueToday(t){
   if(t.stage<0) return false;
   const nr=nextReview(t);
   if(!nr) return false;
+  // Never show due on Saturday — those were already pushed to Sunday by skipSat
+  if(isSat(today())) return false;
   return dateOf(nr.getTime())<=today();
 }
 function isDueThisWeek(t){
@@ -510,15 +534,11 @@ function applyResult(id, correct){
   if(correct){
     t.ok++;
     t.stage++;
-    if(t.stage<SR.length){
-      t.nextMs=addDays(dateOf(t.learnedMs),SR[t.stage]).getTime();
-    } else {
-      t.nextMs=addDays(now,60).getTime();
-    }
+    t.nextMs=calcNextMs(t.learnedMs, t.stage, now);
     toast('✅ '+t.n+' — '+stageLabel(t));
   } else {
     t.stage=1;
-    t.nextMs=addDays(dateOf(t.learnedMs||now.getTime()),SR[1]).getTime();
+    t.nextMs=calcNextMs(t.learnedMs||now.getTime(), 1, now);
     toast('❌ '+t.n+' — reset to Stage 1');
   }
   topics[i]=t;
@@ -534,9 +554,10 @@ function startTopic(id){
   const now=today();
   topics[i].stage=0;
   topics[i].learnedMs=now.getTime();
-  topics[i].nextMs=addDays(now,SR[1]).getTime();
+  topics[i].nextMs=calcNextMs(now.getTime(), 1, now);
   saveT(topics);
-  toast('📚 Started "'+topics[i].n+'" — review tomorrow!');
+  const nextDate=fmtDate(topics[i].nextMs);
+  toast('📚 Started "'+topics[i].n+'" — next review '+nextDate);
   bumpStreak();
   renderAll();
 }
@@ -598,12 +619,28 @@ function renderDash(){
   document.getElementById('rdLabel').textContent=(rLabels.find(x=>r>=x[0])||rLabels[5])[1];
   document.getElementById('rdSub').textContent=mastered.length+' of '+topics.length+' topics mastered · '+started.length+' in progress';
 
-  // Goal
+  // Goal — Saturday off, Sunday catch-up
   const dLeft=diffDays(today(),EXAM);
   const notStarted=topics.filter(t=>t.stage<0).length;
-  const newPD=dLeft>0?Math.max(1,Math.ceil(notStarted/dLeft)):notStarted;
-  document.getElementById('goalTxt').textContent='Today: '+dueToday.length+' review'+(dueToday.length!==1?'s':'')+' + '+newPD+' new topic'+(newPD!==1?'s':'');
-  document.getElementById('goalSub').textContent=notStarted+' topics left to start · '+dLeft+' days until exam';
+  const todayDow=today().getDay(); // 0=Sun,6=Sat
+  let goalTxt, goalSub;
+  if(todayDow===6){
+    // Saturday — rest day
+    goalTxt='🌿 Rest day — no study today!';
+    goalSub='Saturdays are kept free. Any due topics have been moved to Sunday.';
+  } else if(todayDow===0){
+    // Sunday — catch-up day, count topics that were moved from Saturday
+    const sundayDue=dueToday.length;
+    goalTxt='☀️ Sunday catch-up: '+sundayDue+' review'+(sundayDue!==1?'s':'')+' + new topics';
+    goalSub='Sundays carry extra load to compensate for Saturday rest · '+dLeft+' days left';
+  } else {
+    const studyDaysLeft=Math.max(1, Math.ceil(dLeft*(5/7))); // rough weekday count
+    const newPD=Math.max(0,Math.ceil(notStarted/studyDaysLeft));
+    goalTxt='Today: '+dueToday.length+' review'+(dueToday.length!==1?'s':'')+' + '+newPD+' new topic'+(newPD!==1?'s':'');
+    goalSub=notStarted+' topics left to start · '+dLeft+' days until exam';
+  }
+  document.getElementById('goalTxt').textContent=goalTxt;
+  document.getElementById('goalSub').textContent=goalSub;
 
   // Badges
   document.getElementById('bdgToday').textContent=dueToday.length;
@@ -745,7 +782,7 @@ function toggleCat(cat){
   topics=topics.map(t=>{
     if(t.cat===cat && t.stage<0){
       count++;
-      return {...t,stage:0,learnedMs:now.getTime(),nextMs:addDays(now,SR[1]).getTime()};
+      return {...t,stage:0,learnedMs:now.getTime(),nextMs:calcNextMs(now.getTime(),1,now)};
     }
     return t;
   });
@@ -760,27 +797,23 @@ function startAllUnstarted(){
   const now=today();
   const allStarted=topics.every(t=>t.stage>=0);
   if(allStarted){
-    // Unselect all — reset every topic back to not started
     topics=topics.map(t=>({...t,stage:-1,learnedMs:null,nextMs:null,ok:0}));
     saveT(topics);
     toast('↩️ All topics reset to unstarted');
-    renderTopics();
-    renderDash();
-    return;
+    renderTopics(); renderDash(); return;
   }
   let count=0;
   topics=topics.map(t=>{
     if(t.stage<0){
       count++;
-      return {...t,stage:0,learnedMs:now.getTime(),nextMs:addDays(now,SR[1]).getTime()};
+      return {...t,stage:0,learnedMs:now.getTime(),nextMs:calcNextMs(now.getTime(),1,now)};
     }
     return t;
   });
   saveT(topics);
   toast('🚀 Started all '+count+' topics!');
   bumpStreak();
-  renderTopics();
-  renderDash();
+  renderTopics(); renderDash();
 }
 
 function startHighFreq(){
@@ -790,7 +823,7 @@ function startHighFreq(){
   topics=topics.map(t=>{
     if(t.stage<0 && t.n.includes('⭐')){
       count++;
-      return {...t,stage:0,learnedMs:now.getTime(),nextMs:addDays(now,SR[1]).getTime()};
+      return {...t,stage:0,learnedMs:now.getTime(),nextMs:calcNextMs(now.getTime(),1,now)};
     }
     return t;
   });
@@ -798,8 +831,7 @@ function startHighFreq(){
   saveT(topics);
   toast('⭐ Started '+count+' high-frequency topics!');
   bumpStreak();
-  renderTopics();
-  renderDash();
+  renderTopics(); renderDash();
 }
 
 // ═══════════════════════════════════════
@@ -877,7 +909,13 @@ function renderCalendar(){
 
   const container=document.getElementById('calContainer');
   const now=today();
-  let html='';
+  // Legend
+  let html=`<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;font-size:12px;font-weight:700">
+    <span style="display:flex;align-items:center;gap:5px"><span style="width:14px;height:14px;border-radius:4px;background:linear-gradient(135deg,var(--pink),var(--lav));display:inline-block"></span>Today</span>
+    <span style="display:flex;align-items:center;gap:5px"><span style="width:14px;height:14px;border-radius:4px;background:var(--pink-m);display:inline-block"></span>Reviews due</span>
+    <span style="display:flex;align-items:center;gap:5px"><span style="width:14px;height:14px;border-radius:4px;background:#f1f5f9;display:inline-block;border:1.5px dashed #cbd5e1"></span>Rest (Sat)</span>
+    <span style="display:flex;align-items:center;gap:5px"><span style="width:14px;height:14px;border-radius:4px;background:var(--yel-m);display:inline-block"></span>Sunday</span>
+  </div>`;
   for(let mi=0;mi<4;mi++){
     const d=new Date(now.getFullYear(),now.getMonth()+mi,1);
     const year=d.getFullYear(), month=d.getMonth();
@@ -886,20 +924,32 @@ function renderCalendar(){
     const daysInMonth=new Date(year,month+1,0).getDate();
     const days=['Mo','Tu','We','Th','Fr','Sa','Su'];
     html+=`<div class="cal-m"><h3>🌸 ${mName}</h3><div class="cal-g">`;
-    html+=days.map(d=>`<div class="cal-dh">${d}</div>`).join('');
+    html+=days.map(dh=>{
+      const isSaHdr=dh==='Sa';
+      return `<div class="cal-dh" style="${isSaHdr?'color:#94a3b8;text-decoration:line-through':''}">${dh}</div>`;
+    }).join('');
     for(let i=0;i<firstDay;i++) html+=`<div class="cal-d emp"></div>`;
     for(let day=1;day<=daysInMonth;day++){
       const thisDate=new Date(year,month,day);
+      const dow=thisDate.getDay(); // 0=Sun,6=Sat
       const k=toDateStr(thisDate);
       const isToday=thisDate.toDateString()===now.toDateString();
       const isPast=thisDate<now && !isToday;
+      const isSatDay=dow===6;
+      const isSunDay=dow===0;
       const count=reviewMap[k]||0;
       let cls='cal-d';
+      let extraStyle='';
       if(isToday) cls+=' tod';
+      else if(isSatDay){ extraStyle='background:#f1f5f9;border:1.5px dashed #cbd5e1;opacity:.7;'; }
+      else if(isSunDay && !isPast){ extraStyle='background:var(--yel-m);'; cls+=(count?' hr':''); }
       else if(isPast) cls+=' past';
       else if(count) cls+=' hr';
-      html+=`<div class="${cls}">${day}${count&&!isToday?`<div class="dc">${count}</div>`:''}`;
+      const satLabel=isSatDay?`<div class="dc" style="font-size:8px;color:#94a3b8">off</div>`:'';
+      html+=`<div class="${cls}" style="${extraStyle}">${day}`;
       if(isToday) html+=`<div class="dc">📍</div>`;
+      else if(isSatDay) html+=satLabel;
+      else if(count) html+=`<div class="dc">${count}</div>`;
       html+=`</div>`;
     }
     html+=`</div></div>`;
